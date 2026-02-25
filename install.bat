@@ -20,6 +20,7 @@ echo @python "%INSTALL_DIR%\foreman-report.py"  %%* > "%BIN_DIR%\foreman-report.
 echo.
 echo Installed to %INSTALL_DIR%
 echo Shims created in %BIN_DIR%
+echo "Also remember install the open-ralph-wiggum-v1.2.1-with-verbose!"
 
 echo %PATH% | find /I "C:\bin" >nul 2>&1
 if errorlevel 1 (

@@ -18,7 +18,7 @@ echo "Installed:"
 echo "  foreman-prepare -> $BIN_DIR/foreman-prepare"
 echo "  foreman-run     -> $BIN_DIR/foreman-run"
 echo "  foreman-report  -> $BIN_DIR/foreman-report"
-
+echo "Also remember install the open-ralph-wiggum-v1.2.1-with-verbose!"
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo ""
     echo "Note: $BIN_DIR is not in your PATH."
