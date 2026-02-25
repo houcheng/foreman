@@ -4,18 +4,15 @@ foreman-run.py
 
 Monitors todo/ for PRD symlinks matching prd-{number}-{anything}.md.
 When a new one appears, runs ralph in --tasks mode, polls completion,
-then archives the .ralph/ state and stream log to done/.
+then archives the .ralph/ state to done/.
 
 Workflow:
     1. User runs: python foreman-prepare.py   (numbers PRDs and user stories in tasks/)
     2. User symlinks: ln -s ../tasks/prd-07-xxx.md todo/prd-07-xxx.md
-    3. This script detects the symlink → runs ralph (patched -logfile fork)
+    3. This script detects the symlink → runs ralph
     4. Polls: ralph --status --tasks until Progress N/N complete
     5. Archives .ralph/ → done/prd-07-xxx-ralph-YYYYMMDD-HHMMSS/
-    6. Moves stream log → done/prd-07-xxx-stream-YYYYMMDD-HHMMSS.log
-    7. Removes symlink from todo/
-
-Requires the patched ralph fork (version ending with -logfile).
+    6. Removes symlink from todo/
 
 Run from project root (same dir as .ralph/, tasks/, todo/, done/).
 
@@ -39,7 +36,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 DEFAULT_POLL_INTERVAL   = 5   # seconds between todo/ scans
 DEFAULT_STATUS_INTERVAL = 30  # seconds between ralph --status polls while running
-DEFAULT_MAX_ITERATIONS  = 3
+DEFAULT_MAX_ITERATIONS  = 5
 DEFAULT_AGENT           = 'claude-code'
 
 # Matches prd-{one_or_more_digits}-{anything}.md
@@ -47,6 +44,7 @@ PRD_PATTERN = re.compile(r'^prd-(\d+)-.+\.md$')
 
 TODO_DIR  = Path('todo')
 DONE_DIR  = Path('done')
+TASKS_DIR = Path('tasks')
 RALPH_DIR = Path('.ralph')
 STATE_FILE = Path('.todo_monitor.json')
 
@@ -69,7 +67,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {'processed': [], 'in_progress': None, 'current_ralph_log': ''}
+    return {'processed': [], 'in_progress': None}
 
 
 def save_state(state: dict):
@@ -192,21 +190,19 @@ def remove_symlink(p: Path):
         log(f"Warning: could not remove {p}: {e}")
 
 
-def start_ralph(prd_path: Path, log_path: Path, max_iterations: int, agent: str,
+def start_ralph(prd_path: Path, max_iterations: int, agent: str,
                 gnome_terminal: bool = False, model: str = '',
-                no_allow_all: bool = False, extra_ralph_flags: list = [],
-                ralph_log_file: str = ''):
+                no_allow_all: bool = False, extra_ralph_flags: list = []):
     """
     Spawn ralph as a subprocess.
 
     gnome_terminal=False (default):
-        ralph runs silently; stdout/stderr are captured to log_path.
+        ralph runs in the foreground of the foreman terminal.
         Use 'ralph --status --tasks' in another terminal for live progress.
 
     gnome_terminal=True:
         ralph is launched in a new gnome-terminal window so you can watch it live.
         The window title is the PRD filename.
-        Output is ALSO tee'd to log_path for archival.
         Because gnome-terminal --wait is used, the returned process tracks the
         terminal window lifetime (not the ralph process directly), so exit-code
         checking is still meaningful (0 = window closed normally).
@@ -222,22 +218,14 @@ def start_ralph(prd_path: Path, log_path: Path, max_iterations: int, agent: str,
         ralph_cmd += ['--model', model]
     if no_allow_all:
         ralph_cmd += ['--no-allow-all']
-    if ralph_log_file:
-        ralph_cmd += ['--log-file', ralph_log_file]
     if extra_ralph_flags:
         ralph_cmd += extra_ralph_flags
     log(f"Starting: {' '.join(ralph_cmd)}")
-    log(f"Log: {log_path}")
 
     if gnome_terminal:
-        # Tee ralph output to both the terminal window AND a log file.
-        # gnome-terminal --wait: the Popen tracks the terminal window process,
-        # which exits when the shell inside it finishes.
-        # We use 'bash -c "cmd 2>&1 | tee logfile; echo; read -p DONE"' so the
-        # window stays open until the user presses Enter (gives them time to read).
         inner = (
-            f"{' '.join(ralph_cmd)} 2>&1 | tee {str(log_path)!r}; "
-            f"echo; echo '--- ralph finished --- press Enter to close ---'; read"
+            f"{' '.join(ralph_cmd)}; "
+            f"echo; echo '--- ralph finished --- press Enter to close (auto-closes in 5s) ---'; read -t 5"
         )
         cmd = [
             'gnome-terminal',
@@ -248,12 +236,9 @@ def start_ralph(prd_path: Path, log_path: Path, max_iterations: int, agent: str,
         ]
         log("Launching in gnome-terminal window (watch it there for live output)")
         proc = subprocess.Popen(cmd)
-        proc._log_fh = None
     else:
         log("Tip: run 'ralph --status --tasks' in another terminal to watch progress")
-        lf = open(log_path, 'w')
-        proc = subprocess.Popen(ralph_cmd, stdout=lf, stderr=lf)
-        proc._log_fh = lf
+        proc = subprocess.Popen(ralph_cmd)
 
     return proc
 
@@ -263,13 +248,12 @@ def start_ralph(prd_path: Path, log_path: Path, max_iterations: int, agent: str,
 # ---------------------------------------------------------------------------
 
 def handle_finished_job(current_prd: Path, state: dict, success: bool,
-                        done: int = 0, total: int = 0, ralph_log_file: str = ''):
+                        done: int = 0, total: int = 0):
     """
     Called after ralph exits (or is detected complete via --status).
     On success: archive .ralph/, remove symlink, mark processed.
     On partial: warn, leave .ralph/ and symlink for manual review, still mark processed
                 so the monitor doesn't re-queue it on restart.
-    In both cases: move the ralph stream log to done/ if it exists.
     """
     if success:
         log(f"All {total}/{total} tasks complete for {current_prd.name}!")
@@ -283,20 +267,8 @@ def handle_finished_job(current_prd: Path, state: dict, success: bool,
         log("Leaving .ralph/ and todo symlink in place for manual review.")
         log(f"To resume: ralph --file {current_prd} --tasks --agent {DEFAULT_AGENT}")
 
-    # Move the ralph stream log to done/ regardless of success/failure
-    if ralph_log_file:
-        log_p = Path(ralph_log_file)
-        if log_p.exists():
-            DONE_DIR.mkdir(exist_ok=True)
-            dest = DONE_DIR / log_p.name
-            shutil.move(str(log_p), str(dest))
-            log(f"Moved ralph log → {dest}")
-        else:
-            log(f"Note: ralph log not found at {log_p} (nothing to move)")
-
     state['processed'].append(current_prd.name)
     state['in_progress'] = None
-    state['current_ralph_log'] = ''
     save_state(state)
 
 
@@ -312,7 +284,7 @@ def main():
             'Folders:\n'
             '  tasks/   PRD source files (authored here, numbered by prd_prepare.py)\n'
             '  todo/    Symlinks to PRDs queued for execution (one at a time)\n'
-            '  done/    Completed archives: .ralph/ state dirs and stream logs\n'
+            '  done/    Completed archives: .ralph/ state dirs\n'
             '  .ralph/  Active ralph loop state (created by ralph, archived on completion)\n'
             '\n'
             'PRD workflow:\n'
@@ -329,19 +301,25 @@ def main():
             '         ralph --file todo/prd-07-my-feature.md --tasks --agent claude-code ...\n'
             '    5. Polls "ralph --status --tasks" every N seconds until all tasks complete\n'
             '    6. Archives .ralph/ state  →  done/prd-07-my-feature-ralph-<ts>/\n'
-            '    7. Moves the stream log    →  done/prd-07-my-feature-stream-<ts>.log\n'
-            '    8. Removes the todo/ symlink, then loops back to check for the next PRD\n'
+            '    7. Removes the todo/ symlink, then loops back to check for the next PRD\n'
             '\n'
             'Run from the project root (same directory as tasks/, todo/, done/, .ralph/).'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument('--doc', action='store_true', help='Show FOREMAN.md documentation')
     parser.add_argument('--poll-interval',   type=int, default=DEFAULT_POLL_INTERVAL,
                         help=f'Seconds between todo/ scans (default {DEFAULT_POLL_INTERVAL})')
     parser.add_argument('--status-interval', type=int, default=DEFAULT_STATUS_INTERVAL,
                         help=f'Seconds between ralph --status polls (default {DEFAULT_STATUS_INTERVAL})')
     parser.add_argument('--max-iterations',  type=int, default=DEFAULT_MAX_ITERATIONS,
                         help=f'--max-iterations passed to ralph (default {DEFAULT_MAX_ITERATIONS})')
+    parser.add_argument('--max-retries',     type=int, default=3,
+                        help='Max times to restart ralph when tasks incomplete after exit code 0 '
+                             '(default 10, 0=unlimited)')
+    parser.add_argument('--max-error-retries', type=int, default=3,
+                        help='Max times to restart ralph after a non-zero exit code '
+                             '(default 3, 0=no retry)')
     parser.add_argument('--agent',           default=DEFAULT_AGENT,
                         help=f'--agent passed to ralph (default {DEFAULT_AGENT})')
     parser.add_argument('--term',            action='store_true', default=False,
@@ -356,38 +334,53 @@ def main():
                         help='Pass --no-allow-all to ralph, disabling the default '
                              '--dangerously-skip-permissions bypass (enables interactive prompts). '
                              'By default ralph allows all permissions automatically.')
-    parser.add_argument('--ralph-log-file',  default='',
-                        help='Override the auto-generated ralph stream log path. '
-                             'By default a file named {prd-stem}-stream-{ts}.log is created '
-                             'in the current directory and moved to done/ after completion.')
+    parser.add_argument('--create-dirs',     action='store_true', default=False,
+                        help='Create missing required folders (todo/, done/) and exit.')
     parser.add_argument('--',                dest='extra_ralph_flags', nargs=argparse.REMAINDER,
                         default=[],
                         help='Extra flags passed verbatim to ralph '
                              '(e.g. -- --verbose-tools)')
     args = parser.parse_args()
 
+    if args.doc:
+        if sys.platform == 'win32':
+            doc_path = Path(r'C:\bin\foreman\FOREMAN.md')
+        else:
+            doc_path = Path(__file__).resolve().parent / 'FOREMAN.md'
+        print(doc_path.read_text() if doc_path.exists() else f'FOREMAN.md not found at {doc_path}')
+        return
+
     # ------------------------------------------------------------------
-    # Verify ralph version has -logfile suffix (our patched fork)
+    # Verify ralph is available
     # ------------------------------------------------------------------
     try:
         r = subprocess.run(['ralph', '--version'], capture_output=True, text=True, timeout=10)
         ralph_version = (r.stdout + r.stderr).strip()
-        if not ralph_version.endswith('-logfile'):
-            log(f"ERROR: ralph version '{ralph_version}' is not the patched fork.")
-            log("       Expected a version ending with '-logfile' (open-ralph-wiggum/ralph.ts).")
-            log("       Run: cd open-ralph-wiggum && bun install && bun link")
-            sys.exit(1)
         log(f"ralph version: {ralph_version} ✓")
     except FileNotFoundError:
-        log("ERROR: 'ralph' not found in PATH. Install the patched fork first.")
+        log("ERROR: 'ralph' not found in PATH.")
         sys.exit(1)
     except subprocess.TimeoutExpired:
         log("ERROR: 'ralph --version' timed out.")
         sys.exit(1)
 
-    # Ensure directories exist
-    TODO_DIR.mkdir(exist_ok=True)
-    DONE_DIR.mkdir(exist_ok=True)
+    # --create-dirs: create missing folders and exit
+    if args.create_dirs:
+        for d in (TASKS_DIR, TODO_DIR, DONE_DIR):
+            d.mkdir(exist_ok=True)
+            print(f"Created: {d}/")
+        print("Done. Run foreman-run.py again to start monitoring.")
+        return
+
+    # Check required directories exist — do not auto-create them
+    missing = [d for d in (TASKS_DIR, TODO_DIR, DONE_DIR) if not d.exists()]
+    if missing:
+        print("ERROR: The following required folders are missing:")
+        for d in missing:
+            print(f"  {d}/")
+        print()
+        print("Run with --doc to see how it works, or --create-dirs to create them.")
+        sys.exit(1)
 
     state = load_state()
     current_proc: subprocess.Popen | None = None
@@ -413,10 +406,8 @@ def main():
     # ------------------------------------------------------------------
     # On restart: check if a previous session left an in-progress job
     # ------------------------------------------------------------------
-    current_ralph_log: str = ''
     if state.get('in_progress'):
         prev = Path(state['in_progress'])
-        prev_ralph_log = state.get('current_ralph_log', '')
         log(f"Previous session had in-progress job: {prev.name}")
         status = get_ralph_status()
 
@@ -425,8 +416,7 @@ def main():
             log("Ralph completed while monitor was offline. Cleaning up.")
             prog = parse_progress(status)
             done_n, total_n = prog if prog else (0, 0)
-            handle_finished_job(prev, state, success=True, done=done_n, total=total_n,
-                                 ralph_log_file=prev_ralph_log)
+            handle_finished_job(prev, state, success=True, done=done_n, total=total_n)
 
         elif is_no_active_loop(status):
             # Ralph stopped without completing
@@ -438,14 +428,12 @@ def main():
                 log("Ralph stopped; could not determine progress.")
             handle_finished_job(prev, state, success=False,
                                  done=prog[0] if prog else 0,
-                                 total=prog[1] if prog else 0,
-                                 ralph_log_file=prev_ralph_log)
+                                 total=prog[1] if prog else 0)
 
         else:
             # Ralph appears to still be running in another terminal
             log("Ralph still appears to be running. Will monitor via --status polling.")
             current_prd = prev
-            current_ralph_log = prev_ralph_log
             # current_proc stays None — we'll use --status to detect completion
 
     # ------------------------------------------------------------------
@@ -460,21 +448,60 @@ def main():
 
         # ── A. Spawned ralph process finished ──────────────────────────────
         if current_proc is not None and current_proc.poll() is not None:
-            if getattr(current_proc, '_log_fh', None) is not None:
-                current_proc._log_fh.close()
             exit_code = current_proc.returncode
             log(f"Ralph exited (exit code {exit_code})")
 
-            status = get_ralph_status()
-            prog   = parse_progress(status)
+            status  = get_ralph_status()
+            prog    = parse_progress(status)
             done_n, total_n = prog if prog else (0, 0)
             success = is_all_complete(status)
-            handle_finished_job(current_prd, state, success=success,
-                                 done=done_n, total=total_n,
-                                 ralph_log_file=current_ralph_log)
-            current_proc      = None
-            current_prd       = None
-            current_ralph_log = ''
+
+            if not success and exit_code == 0:
+                retry_count = state.get('retry_count', 0) + 1
+                max_retries = args.max_retries
+                if max_retries == 0 or retry_count <= max_retries:
+                    state['retry_count'] = retry_count
+                    save_state(state)
+                    retry_label = f"{retry_count}/{max_retries}" if max_retries else f"{retry_count}/∞"
+                    log(f"Tasks incomplete ({done_n}/{total_n}). Auto-retrying [{retry_label}]...")
+                    current_proc = start_ralph(current_prd,
+                                               args.max_iterations, args.agent,
+                                               gnome_terminal=args.term,
+                                               model=args.model,
+                                               no_allow_all=args.no_allow_all,
+                                               extra_ralph_flags=args.extra_ralph_flags)
+                    last_status_check = now
+                else:
+                    log(f"Max retries ({max_retries}) reached. Giving up on {current_prd.name}.")
+                    handle_finished_job(current_prd, state, success=False,
+                                        done=done_n, total=total_n)
+                    current_proc = None
+                    current_prd  = None
+            elif exit_code != 0:
+                error_retry_count = state.get('error_retry_count', 0) + 1
+                max_err = args.max_error_retries
+                if max_err > 0 and error_retry_count <= max_err:
+                    state['error_retry_count'] = error_retry_count
+                    save_state(state)
+                    log(f"Ralph error (exit {exit_code}). Retrying [{error_retry_count}/{max_err}]...")
+                    current_proc = start_ralph(current_prd,
+                                               args.max_iterations, args.agent,
+                                               gnome_terminal=args.term,
+                                               model=args.model,
+                                               no_allow_all=args.no_allow_all,
+                                               extra_ralph_flags=args.extra_ralph_flags)
+                    last_status_check = now
+                else:
+                    log(f"Ralph error (exit {exit_code}), max error retries ({max_err}) reached.")
+                    handle_finished_job(current_prd, state, success=False,
+                                        done=done_n, total=total_n)
+                    current_proc = None
+                    current_prd  = None
+            else:
+                handle_finished_job(current_prd, state, success=True,
+                                     done=done_n, total=total_n)
+                current_proc = None
+                current_prd  = None
 
         # ── B. Monitoring a resumed job (no process handle) ────────────────
         elif current_prd is not None and current_proc is None:
@@ -489,10 +516,8 @@ def main():
                     success = is_all_complete(status)
                     handle_finished_job(current_prd, state, success=success,
                                         done=prog[0] if prog else 0,
-                                        total=prog[1] if prog else 0,
-                                        ralph_log_file=current_ralph_log)
-                    current_prd       = None
-                    current_ralph_log = ''
+                                        total=prog[1] if prog else 0)
+                    current_prd = None
                 last_status_check = now
 
         # ── C. Status heartbeat while ralph is running (for logging) ───────
@@ -521,26 +546,18 @@ def main():
                 # New PRD found — guard against stale .ralph/ first
                 backup_stale_ralph()
 
-                ts_str   = datetime.now().strftime('%Y%m%d-%H%M%S')
-                log_path = DONE_DIR / f"{prd_path.stem}-ralph-{ts_str}.log"
-
-                # Ralph stream log: named by PRD stem + timestamp, lives in cwd until
-                # completion, then moved to done/ by handle_finished_job.
-                ralph_log = args.ralph_log_file or f"{prd_path.stem}-stream-{ts_str}.log"
-
-                current_prd       = prd_path
-                current_ralph_log = ralph_log
-                state['in_progress']       = str(prd_path)
-                state['current_ralph_log'] = ralph_log
+                current_prd = prd_path
+                state['in_progress'] = str(prd_path)
+                state['retry_count'] = 0
+                state['error_retry_count'] = 0
                 save_state(state)
 
-                current_proc      = start_ralph(prd_path, log_path,
-                                                args.max_iterations, args.agent,
-                                                gnome_terminal=args.term,
-                                                model=args.model,
-                                                no_allow_all=args.no_allow_all,
-                                                extra_ralph_flags=args.extra_ralph_flags,
-                                                ralph_log_file=ralph_log)
+                current_proc = start_ralph(prd_path,
+                                           args.max_iterations, args.agent,
+                                           gnome_terminal=args.term,
+                                           model=args.model,
+                                           no_allow_all=args.no_allow_all,
+                                           extra_ralph_flags=args.extra_ralph_flags)
                 last_status_check = now
                 break  # one at a time: remaining PRDs will be picked up next iteration
 

@@ -1,41 +1,10 @@
-# Foreman
+# Foreman Standard Operating Procedure
 
-Foreman is a two-script utility that automates the execution of PRD-driven AI coding tasks
-using [ralph](https://github.com/ghuntley/open-ralph-wiggum) and Claude Code.
-
-You write PRDs. Foreman assigns numbers, queues them, runs them one at a time, and archives
-the results.
-
-```
-tasks/          ← you write PRDs here
-todo/           ← symlinks to PRDs queued for execution
-done/           ← completed archives (ralph state + stream logs)
-.ralph/         ← active ralph loop state (managed by ralph)
-```
-
----
-
-## Scripts
-
-| Script | Purpose |
-|---|---|
-| `foreman-prepare.py` | Assigns `prd-NN-` prefixes and `US-x` numbers to user stories |
-| `foreman-run.py` | Watches `todo/`, drives ralph, archives results |
-
----
-
-## Standard Operating Procedure
-
-### Step 1 — Write a PRD
+## Step 1a — Manual write a PRD
 
 Create a markdown file in `tasks/` named `prd-<slug>.md` (no number yet).
 
-```
 tasks/prd-cloud-sync.md
-```
-
-Use plain markdown. Mark each user story with a `US-x` placeholder:
-
 ```markdown
 # Cloud Sync Feature
 
@@ -45,15 +14,15 @@ Allow the user to back up their EPUB library to Dropbox.
 ## US-x  Restore from backup
 Allow the user to restore their library from a Dropbox backup.
 ```
-### Step 1 - User claude /ralph-tui-prd skill
+### Step 1b - Claude /ralph-tui-prd skill wrtie a PRD
 
 In claude, run /ralph-tui-prd skill and input this
 
 ```
 write a script xxx
-ouput the prd md file into tasks/
-```
 
+Also write the generated prd md file into tasks/
+```
 
 ### Step 2 — Run foreman-prepare
 
@@ -122,6 +91,7 @@ it keeps running. Restart `foreman-run.py` to resume tracking it.
 
 ```
 --dir DIR    Directory to scan for PRD files (default: tasks)
+--link       Create symlinks in todo/ for each processed PRD file
 ```
 
 ### foreman-run.py
@@ -164,10 +134,10 @@ claude-code's stream-json output. It is in `open-ralph-wiggum/` in this repo.
 Install it:
 
 ```bash
-cd open-ralph-wiggum-logfile
+cd open-ralph-wiggum-log-file
 bun install
 bun link          # makes 'ralph' available in PATH
-ralph --version   # must end with -logfile, e.g. 1.2.2-logfile
+ralph --version   # must end with -log-file, e.g. 1.2.2-log-file
 ```
 
 `foreman-run.py` will refuse to start if the wrong ralph version is detected.
@@ -178,7 +148,7 @@ ralph --version   # must end with -logfile, e.g. 1.2.2-logfile
 
 **`ERROR: ralph version '1.2.2' is not the patched fork`**
 Run `cd open-ralph-wiggum && bun install && bun link` and verify `ralph --version`
-ends with `-logfile`.
+ends with `-log-file`.
 
 **Ralph loops without completing**
 Check `done/prd-NN-...-stream-*.log` for the last iteration output.

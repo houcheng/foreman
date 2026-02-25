@@ -19,8 +19,19 @@ def main():
         description='Number PRD files and user stories in tasks/ ready for foreman-run.'
     )
     parser.add_argument("--dir", default="tasks", help="Directory to search for md files (default: tasks)")
+    parser.add_argument("--doc", action="store_true", help="Show FOREMAN.md documentation")
+    parser.add_argument("--link", action="store_true", help="Create symlinks in todo/ for each processed PRD file")
     args = parser.parse_args()
-    
+
+    if args.doc:
+        import sys
+        if sys.platform == 'win32':
+            doc_path = Path(r'C:\bin\foreman\FOREMAN.md')
+        else:
+            doc_path = Path(__file__).resolve().parent / 'FOREMAN.md'
+        print(doc_path.read_text() if doc_path.exists() else f"FOREMAN.md not found at {doc_path}")
+        return
+
     cwd = Path.cwd() / args.dir
     
     if not cwd.exists():
@@ -88,6 +99,18 @@ def main():
         new_path.write_text("".join(result))
     
     print(f"Processed {len(new_assignments)} PRD files")
+
+    if args.link and new_assignments:
+        todo_dir = Path.cwd() / "todo"
+        todo_dir.mkdir(exist_ok=True)
+        for new_path, _ in new_assignments:
+            link_path = todo_dir / new_path.name
+            target = Path("..") / args.dir / new_path.name
+            if link_path.exists() or link_path.is_symlink():
+                print(f"Skip symlink (already exists): {link_path}")
+            else:
+                link_path.symlink_to(target)
+                print(f"Linked: todo/{new_path.name} -> {target}")
 
 if __name__ == "__main__":
     main()
