@@ -1,0 +1,186 @@
+diff --git a/ralph.ts b/ralph.ts
+index d42cdcf..7e15a29 100755
+--- a/ralph.ts
++++ b/ralph.ts
+@@ -7,11 +7,11 @@
+  */
+ 
+ import { $ } from "bun";
+-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "fs";
++import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, openSync, writeSync, closeSync } from "fs";
+ import { join } from "path";
+ import { checkTerminalPromise, stripAnsi, tasksMarkdownAllComplete } from "./completion";
+ 
+-const VERSION = "1.2.2";
++const VERSION = "1.2.2-logfile";
+ 
+ // Detect Windows platform for command resolution
+ const IS_WINDOWS = process.platform === "win32";
+@@ -288,6 +288,12 @@ if (initConfigPath) {
+ 
+ if (args.includes("--help") || args.includes("-h")) {
+   console.log(`
++╔══════════════════════════════════════════════════════════════════╗
++║  ⚠️  MODIFIED VERSION — local fork with --log-file support       ║
++║  Added: --log-file PATH  (stream output also written to file)    ║
++║  Source: open-ralph-wiggum/ralph.ts in this repo                 ║
++╚══════════════════════════════════════════════════════════════════╝
++
+ Ralph Wiggum Loop - Iterative AI development with AI agents
+ 
+ Usage:
+@@ -314,6 +320,7 @@ Options:
+   --prompt-file, --file, -f  Read prompt content from a file
+   --prompt-template PATH  Use custom prompt template (supports variables)
+   --no-stream         Buffer agent output and print at the end
++  --log-file PATH     Also write streamed output to a file (ANSI codes stripped)
+   --verbose-tools     Print every tool line (disable compact tool summary)
+   --questions         Enable interactive question handling (default: enabled)
+   --no-questions      Disable interactive question handling (agent will loop on questions)
+@@ -839,6 +846,7 @@ let promptFile = "";
+ let promptTemplatePath = ""; // Custom prompt template file
+ let streamOutput = true;
+ let verboseTools = false;
++let logFile = "";
+ let promptSource = "";
+ let handleQuestions = true;
+ 
+@@ -968,6 +976,13 @@ for (let i = 0; i < args.length; i++) {
+     allowAllPermissions = true;
+   } else if (arg === "--no-allow-all") {
+     allowAllPermissions = false;
++  } else if (arg === "--log-file") {
++    const val = args[++i];
++    if (!val) {
++      console.error("Error: --log-file requires a file path");
++      process.exit(1);
++    }
++    logFile = val;
+   } else if (arg === "--questions") {
+     handleQuestions = true;
+   } else if (arg === "--no-questions") {
+@@ -1622,11 +1637,15 @@ async function streamProcessOutput(
+     heartbeatIntervalMs: number;
+     iterationStart: number;
+     agent: AgentConfig;
++    logFile?: string;
+   },
+-): Promise<{ stdoutText: string; stderrText: string; toolCounts: Map<string, number> }> {
++): Promise<{ stdoutText: string; stderrText: string; processedText: string; toolCounts: Map<string, number> }> {
+   const toolCounts = new Map<string, number>();
+   let stdoutText = "";
+   let stderrText = "";
++  // processedText accumulates the human-readable output (JSON parsed for claude-code).
++  // Used for completion checking so "COMPLETE" is found in extracted text, not raw JSON.
++  let processedText = "";
+   let lastPrintedAt = Date.now();
+   let lastActivityAt = Date.now();
+   let lastToolSummaryAt = 0;
+@@ -1634,6 +1653,22 @@ async function streamProcessOutput(
+   const compactTools = options.compactTools;
+   const parseToolOutput = options.agent.parseToolOutput;
+ 
++  // Open log file if specified
++  let logFd: number | null = null;
++  if (options.logFile) {
++    const logDir = require("path").dirname(options.logFile);
++    if (logDir && logDir !== "." && !existsSync(logDir)) mkdirSync(logDir, { recursive: true });
++    logFd = openSync(options.logFile, "a");
++  }
++
++  // Write to both processedText accumulator and optional log file
++  const writeToLog = (text: string) => {
++    processedText += text;
++    if (logFd !== null) {
++      writeSync(logFd!, text);
++    }
++  };
++
+   const maybePrintToolSummary = (force = false) => {
+     if (!compactTools || toolCounts.size === 0) return;
+     const now = Date.now();
+@@ -1642,7 +1677,9 @@ async function streamProcessOutput(
+     }
+     const summary = formatToolSummary(toolCounts);
+     if (summary) {
+-      console.log(`| Tools    ${summary}`);
++      const line = `| Tools    ${summary}`;
++      console.log(line);
++      writeToLog(line + "\n");
+       lastPrintedAt = Date.now();
+       lastToolSummaryAt = Date.now();
+     }
+@@ -1663,6 +1700,7 @@ async function streamProcessOutput(
+     for (const outputLine of outputLines) {
+       if (outputLine.length === 0) {
+         console.log("");
++        writeToLog("\n");
+         lastPrintedAt = Date.now();
+         continue;
+       }
+@@ -1671,6 +1709,7 @@ async function streamProcessOutput(
+       } else {
+         console.log(outputLine);
+       }
++      writeToLog(stripAnsi(outputLine) + "\n");
+       lastPrintedAt = Date.now();
+     }
+   };
+@@ -1737,13 +1776,14 @@ async function streamProcessOutput(
+     ]);
+   } finally {
+     clearInterval(heartbeatTimer);
++    if (logFd !== null) closeSync(logFd);
+   }
+ 
+   if (compactTools) {
+     maybePrintToolSummary(true);
+   }
+ 
+-  return { stdoutText, stderrText, toolCounts };
++  return { stdoutText, stderrText, processedText, toolCounts };
+ }
+ // Main loop
+ // Helper to detect per-iteration file changes using content hashes
+@@ -2059,6 +2099,7 @@ async function runRalphLoop(): Promise<void> {
+       const exitCodePromise = proc.exited;
+       let result = "";
+       let stderr = "";
++      let checkTarget = ""; // text used for completion detection (display-processed, not raw JSON)
+       let toolCounts = new Map<string, number>();
+ 
+       if (streamOutput) {
+@@ -2068,15 +2109,20 @@ async function runRalphLoop(): Promise<void> {
+           heartbeatIntervalMs: 10000,
+           iterationStart,
+           agent: agentConfig,
++          logFile: logFile || undefined,
+         });
+         result = streamed.stdoutText;
+         stderr = streamed.stderrText;
+         toolCounts = streamed.toolCounts;
++        // For claude-code, stdoutText is raw JSON lines; use processedText (the human-readable
++        // display lines extracted from JSON) so COMPLETE is detectable rather than buried in JSON.
++        checkTarget = streamed.processedText || result;
+       } else {
+         const stdoutPromise = new Response(proc.stdout).text();
+         const stderrPromise = new Response(proc.stderr).text();
+         [result, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+         toolCounts = collectToolSummaryFromText(`${result}\n${stderr}`, agentConfig);
++        checkTarget = result;
+       }
+ 
+       const exitCode = await exitCodePromise;
+@@ -2090,9 +2136,9 @@ async function runRalphLoop(): Promise<void> {
+       }
+ 
+       const combinedOutput = `${result}\n${stderr}`;
+-      const completionSignalDetected = checkCompletion(result, completionPromise);
+-      const abortDetected = abortPromise ? checkCompletion(result, abortPromise) : false;
+-      const taskCompletionDetected = tasksMode ? checkCompletion(result, taskPromise) : false;
++      const completionSignalDetected = checkCompletion(checkTarget, completionPromise);
++      const abortDetected = abortPromise ? checkCompletion(checkTarget, abortPromise) : false;
++      const taskCompletionDetected = tasksMode ? checkCompletion(checkTarget, taskPromise) : false;
+ 
+       let completionDetected = completionSignalDetected;
+       if (tasksMode && completionSignalDetected) {
