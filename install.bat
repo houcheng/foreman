@@ -10,12 +10,12 @@ if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 
 copy /Y "%SCRIPT_DIR%foreman-prepare.py" "%INSTALL_DIR%\foreman-prepare.py"
 copy /Y "%SCRIPT_DIR%foreman-run.py"     "%INSTALL_DIR%\foreman-run.py"
-copy /Y "%SCRIPT_DIR%foreman-report.py"  "%INSTALL_DIR%\foreman-report.py"
+copy /Y "%SCRIPT_DIR%foreman-status.py"  "%INSTALL_DIR%\foreman-status.py"
 copy /Y "%SCRIPT_DIR%FOREMAN.md"         "%INSTALL_DIR%\FOREMAN.md"
 
 echo @python "%INSTALL_DIR%\foreman-prepare.py" %%* > "%BIN_DIR%\foreman-prepare.bat"
 echo @python "%INSTALL_DIR%\foreman-run.py"     %%* > "%BIN_DIR%\foreman-run.bat"
-echo @python "%INSTALL_DIR%\foreman-report.py"  %%* > "%BIN_DIR%\foreman-report.bat"
+echo @python "%INSTALL_DIR%\foreman-status.py"  %%* > "%BIN_DIR%\foreman-status.bat"
 
 echo.
 echo Installed to %INSTALL_DIR%

@@ -8,16 +8,16 @@ mkdir -p "$BIN_DIR"
 
 chmod +x "$SCRIPT_DIR/foreman-prepare.py"
 chmod +x "$SCRIPT_DIR/foreman-run.py"
-chmod +x "$SCRIPT_DIR/foreman-report.py"
+chmod +x "$SCRIPT_DIR/foreman-status.py"
 
 ln -sf "$SCRIPT_DIR/foreman-prepare.py" "$BIN_DIR/foreman-prepare"
 ln -sf "$SCRIPT_DIR/foreman-run.py"     "$BIN_DIR/foreman-run"
-ln -sf "$SCRIPT_DIR/foreman-report.py"  "$BIN_DIR/foreman-report"
+ln -sf "$SCRIPT_DIR/foreman-status.py"  "$BIN_DIR/foreman-status"
 
 echo "Installed:"
 echo "  foreman-prepare -> $BIN_DIR/foreman-prepare"
 echo "  foreman-run     -> $BIN_DIR/foreman-run"
-echo "  foreman-report  -> $BIN_DIR/foreman-report"
+echo "  foreman-status  -> $BIN_DIR/foreman-status"
 echo "Also remember install the open-ralph-wiggum-v1.2.1-with-verbose!"
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo ""

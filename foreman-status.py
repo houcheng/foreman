@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-foreman-report.py
+foreman-status.py
 
 Shows a summary of ralph task history:
   - If .ralph/ralph-tasks.md exists, runs 'ralph --status --tasks' to show active loop status
   - Lists all completed ralph runs in done/ in chronological order with their tasks
 
 Usage:
-    python foreman-report.py [--done-dir done]
+    python foreman-status.py [--done-dir done]
 """
 import re
 import subprocess
