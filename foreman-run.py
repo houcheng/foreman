@@ -27,9 +27,11 @@ import time
 import shutil
 import signal
 import argparse
+import threading
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -47,6 +49,12 @@ DONE_DIR  = Path('done')
 TASKS_DIR = Path('tasks')
 RALPH_DIR = Path('.ralph')
 STATE_FILE = Path('.todo_monitor.json')
+
+# Matches: "You've hit your limit · resets 1pm (Asia/Taipei)"
+RATE_LIMIT_RE = re.compile(
+    r"hit your limit[^\n]*resets\s+(\d{1,2}(?::\d{2})?(?:am|pm))\s+\(([^)]+)\)",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +75,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {'processed': [], 'in_progress': None}
+    return {'in_progress': None}
 
 
 def save_state(state: dict):
@@ -190,23 +198,44 @@ def remove_symlink(p: Path):
         log(f"Warning: could not remove {p}: {e}")
 
 
+def parse_reset_datetime(time_str: str, tz_name: str):
+    """Parse '1pm' / '1:30pm' in a named timezone into a future datetime."""
+    try:
+        tz = ZoneInfo(tz_name)
+        time_str = time_str.strip().upper()
+        fmt = '%I:%M%p' if ':' in time_str else '%I%p'
+        t = datetime.strptime(time_str, fmt).time()
+        now_local = datetime.now(tz)
+        reset = now_local.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        if reset <= now_local:
+            reset += timedelta(days=1)
+        return reset
+    except Exception:
+        return None
+
+
+def _pipe_output(proc, rate_limit_info: dict):
+    """Echo ralph stdout to terminal; detect rate-limit message."""
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if not rate_limit_info['detected']:
+                m = RATE_LIMIT_RE.search(line)
+                if m:
+                    reset_dt = parse_reset_datetime(m.group(1), m.group(2))
+                    rate_limit_info['detected'] = True
+                    rate_limit_info['reset_time'] = reset_dt
+                    ts_str = reset_dt.strftime('%H:%M %Z') if reset_dt else 'unknown'
+                    log(f"Rate limit detected. Resets at {ts_str}")
+    except Exception:
+        pass
+
+
 def start_ralph(prd_path: Path, max_iterations: int, agent: str,
-                gnome_terminal: bool = False, model: str = '',
-                no_allow_all: bool = False, extra_ralph_flags: list = []):
-    """
-    Spawn ralph as a subprocess.
-
-    gnome_terminal=False (default):
-        ralph runs in the foreground of the foreman terminal.
-        Use 'ralph --status --tasks' in another terminal for live progress.
-
-    gnome_terminal=True:
-        ralph is launched in a new gnome-terminal window so you can watch it live.
-        The window title is the PRD filename.
-        Because gnome-terminal --wait is used, the returned process tracks the
-        terminal window lifetime (not the ralph process directly), so exit-code
-        checking is still meaningful (0 = window closed normally).
-    """
+                model: str = '', no_allow_all: bool = False,
+                extra_ralph_flags: list = []):
+    """Spawn ralph as a subprocess, piping output through foreman for rate-limit detection."""
     ralph_cmd = [
         'ralph',
         '--file', str(prd_path),
@@ -222,25 +251,13 @@ def start_ralph(prd_path: Path, max_iterations: int, agent: str,
         ralph_cmd += extra_ralph_flags
     log(f"Starting: {' '.join(ralph_cmd)}")
 
-    if gnome_terminal:
-        inner = (
-            f"{' '.join(ralph_cmd)}; "
-            f"echo; echo '--- ralph finished --- press Enter to close (auto-closes in 5s) ---'; read -t 5"
-        )
-        cmd = [
-            'gnome-terminal',
-            '--wait',
-            f'--title=ralph: {prd_path.name}',
-            '--',
-            'bash', '-c', inner,
-        ]
-        log("Launching in gnome-terminal window (watch it there for live output)")
-        proc = subprocess.Popen(cmd)
-    else:
-        log("Tip: run 'ralph --status --tasks' in another terminal to watch progress")
-        proc = subprocess.Popen(ralph_cmd)
-
-    return proc
+    rate_limit_info: dict = {'detected': False, 'reset_time': None}
+    proc = subprocess.Popen(ralph_cmd,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    t = threading.Thread(target=_pipe_output, args=(proc, rate_limit_info), daemon=True)
+    t.start()
+    return proc, rate_limit_info
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +268,8 @@ def handle_finished_job(current_prd: Path, state: dict, success: bool,
                         done: int = 0, total: int = 0):
     """
     Called after ralph exits (or is detected complete via --status).
-    On success: archive .ralph/, remove symlink, mark processed.
-    On partial: warn, leave .ralph/ and symlink for manual review, still mark processed
-                so the monitor doesn't re-queue it on restart.
+    On success: archive .ralph/, remove symlink.
+    On partial: warn, leave .ralph/ and symlink in place for manual review.
     """
     if success:
         log(f"All {total}/{total} tasks complete for {current_prd.name}!")
@@ -267,7 +283,6 @@ def handle_finished_job(current_prd: Path, state: dict, success: bool,
         log("Leaving .ralph/ and todo symlink in place for manual review.")
         log(f"To resume: ralph --file {current_prd} --tasks --agent {DEFAULT_AGENT}")
 
-    state['processed'].append(current_prd.name)
     state['in_progress'] = None
     save_state(state)
 
@@ -322,9 +337,6 @@ def main():
                              '(default 3, 0=no retry)')
     parser.add_argument('--agent',           default=DEFAULT_AGENT,
                         help=f'--agent passed to ralph (default {DEFAULT_AGENT})')
-    parser.add_argument('--term',            action='store_true', default=False,
-                        help='Launch ralph inside a new gnome-terminal window '
-                             '(lets you watch progress live; status polling still works)')
     parser.add_argument('--model',           default='',
                         help='Model passed to ralph --model (e.g. claude-sonnet-4-5)')
     parser.add_argument('--allow-all',       action='store_true', default=True,
@@ -385,6 +397,7 @@ def main():
     state = load_state()
     current_proc: subprocess.Popen | None = None
     current_prd:  Path | None = None
+    current_rate_limit_info: dict = {}
     last_status_check = 0.0
 
     # ------------------------------------------------------------------
@@ -456,7 +469,24 @@ def main():
             done_n, total_n = prog if prog else (0, 0)
             success = is_all_complete(status)
 
-            if not success and exit_code == 0:
+            # ── Rate limit: wait until reset, then resume (doesn't count as retry) ──
+            if current_rate_limit_info.get('detected'):
+                reset_dt = current_rate_limit_info.get('reset_time')
+                if reset_dt:
+                    wait_secs = max((reset_dt - datetime.now(reset_dt.tzinfo)).total_seconds() + 60, 0)
+                    log(f"Waiting {int(wait_secs // 60)}m {int(wait_secs % 60)}s for rate limit reset...")
+                    time.sleep(wait_secs)
+                else:
+                    log("Rate limit hit (unknown reset time). Waiting 60 minutes...")
+                    time.sleep(3600)
+                log("Resuming after rate limit reset.")
+                current_proc, current_rate_limit_info = start_ralph(
+                    current_prd, args.max_iterations, args.agent,
+                    model=args.model,
+                    no_allow_all=args.no_allow_all, extra_ralph_flags=args.extra_ralph_flags)
+                last_status_check = now
+
+            elif not success and exit_code == 0:
                 retry_count = state.get('retry_count', 0) + 1
                 max_retries = args.max_retries
                 if max_retries == 0 or retry_count <= max_retries:
@@ -464,12 +494,10 @@ def main():
                     save_state(state)
                     retry_label = f"{retry_count}/{max_retries}" if max_retries else f"{retry_count}/∞"
                     log(f"Tasks incomplete ({done_n}/{total_n}). Auto-retrying [{retry_label}]...")
-                    current_proc = start_ralph(current_prd,
-                                               args.max_iterations, args.agent,
-                                               gnome_terminal=args.term,
-                                               model=args.model,
-                                               no_allow_all=args.no_allow_all,
-                                               extra_ralph_flags=args.extra_ralph_flags)
+                    current_proc, current_rate_limit_info = start_ralph(
+                        current_prd, args.max_iterations, args.agent,
+                        model=args.model,
+                        no_allow_all=args.no_allow_all, extra_ralph_flags=args.extra_ralph_flags)
                     last_status_check = now
                 else:
                     log(f"Max retries ({max_retries}) reached. Giving up on {current_prd.name}.")
@@ -484,12 +512,10 @@ def main():
                     state['error_retry_count'] = error_retry_count
                     save_state(state)
                     log(f"Ralph error (exit {exit_code}). Retrying [{error_retry_count}/{max_err}]...")
-                    current_proc = start_ralph(current_prd,
-                                               args.max_iterations, args.agent,
-                                               gnome_terminal=args.term,
-                                               model=args.model,
-                                               no_allow_all=args.no_allow_all,
-                                               extra_ralph_flags=args.extra_ralph_flags)
+                    current_proc, current_rate_limit_info = start_ralph(
+                        current_prd, args.max_iterations, args.agent,
+                        model=args.model,
+                        no_allow_all=args.no_allow_all, extra_ralph_flags=args.extra_ralph_flags)
                     last_status_check = now
                 else:
                     log(f"Ralph error (exit {exit_code}), max error retries ({max_err}) reached.")
@@ -534,9 +560,6 @@ def main():
         # ── D. Idle: scan todo/ for new PRDs ───────────────────────────────
         if current_proc is None and current_prd is None:
             for prd_path in scan_todo():
-                if prd_path.name in state['processed']:
-                    continue  # already handled
-
                 # Safety: refuse to start if ralph's state file shows an active loop
                 if is_ralph_active():
                     log(f"Skipping {prd_path.name}: ralph state file shows an active loop "
@@ -552,12 +575,10 @@ def main():
                 state['error_retry_count'] = 0
                 save_state(state)
 
-                current_proc = start_ralph(prd_path,
-                                           args.max_iterations, args.agent,
-                                           gnome_terminal=args.term,
-                                           model=args.model,
-                                           no_allow_all=args.no_allow_all,
-                                           extra_ralph_flags=args.extra_ralph_flags)
+                current_proc, current_rate_limit_info = start_ralph(
+                    prd_path, args.max_iterations, args.agent,
+                    model=args.model,
+                    no_allow_all=args.no_allow_all, extra_ralph_flags=args.extra_ralph_flags)
                 last_status_check = now
                 break  # one at a time: remaining PRDs will be picked up next iteration
 
