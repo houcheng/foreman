@@ -40,6 +40,11 @@ Foreman loops indefinitely, picking up queued PRDs, launching ralph, polling unt
 --dir DIR    Directory to scan (default: tasks)
 ```
 
+### foreman-status.py
+```
+--done-dir DIR   Directory of completed archives (default: done)
+```
+
 ### foreman-run.py
 ```
 --poll-interval N     Seconds between todo/ scans (default: 5)
