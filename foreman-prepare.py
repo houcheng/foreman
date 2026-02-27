@@ -29,7 +29,7 @@ def main():
             doc_path = Path(r'C:\bin\foreman\FOREMAN.md')
         else:
             doc_path = Path(__file__).resolve().parent / 'FOREMAN.md'
-        print(doc_path.read_text() if doc_path.exists() else f"FOREMAN.md not found at {doc_path}")
+        print(doc_path.read_text(encoding='utf-8') if doc_path.exists() else f"FOREMAN.md not found at {doc_path}")
         return
 
     cwd = Path.cwd() / args.dir
@@ -71,7 +71,7 @@ def main():
     max_us_num = 0
 
     for f, _ in numbered_prds:
-        content = f.read_text()
+        content = f.read_text(encoding='utf-8')
         for match in us_pattern.finditer(content):
             num = int(match.group(1))
             if num > max_us_num:
@@ -80,7 +80,7 @@ def main():
     us_counter = max_us_num + 1
     
     for new_path, old_name in new_assignments:
-        content = new_path.read_text()
+        content = new_path.read_text(encoding='utf-8')
         us_matches = list(us_pattern.finditer(content))
         
         if not us_matches:
@@ -96,7 +96,7 @@ def main():
             us_counter += 1
         
         result.append(content[last_end:])
-        new_path.write_text("".join(result))
+        new_path.write_text("".join(result), encoding='utf-8')
     
     print(f"Processed {len(new_assignments)} PRD files")
 

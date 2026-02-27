@@ -72,14 +72,14 @@ def log(msg: str):
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            return json.loads(STATE_FILE.read_text(encoding='utf-8'))
         except Exception:
             pass
     return {'in_progress': None}
 
 
 def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding='utf-8')
 
 
 def scan_todo() -> list:
@@ -100,9 +100,9 @@ def get_ralph_status() -> str:
     try:
         r = subprocess.run(
             ['ralph', '--status', '--tasks'],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30
         )
-        return r.stdout + r.stderr
+        return (r.stdout or '') + (r.stderr or '')
     except subprocess.TimeoutExpired:
         log("Warning: ralph --status timed out")
         return ''
@@ -171,7 +171,7 @@ def is_ralph_active() -> bool:
     if not state_file.exists():
         return False
     try:
-        data = json.loads(state_file.read_text())
+        data = json.loads(state_file.read_text(encoding='utf-8'))
         return bool(data.get('active', False))
     except Exception:
         return False
@@ -254,7 +254,7 @@ def start_ralph(prd_path: Path, max_iterations: int, agent: str,
     rate_limit_info: dict = {'detected': False, 'reset_time': None}
     proc = subprocess.Popen(ralph_cmd,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, encoding='utf-8', errors='replace', bufsize=1)
     t = threading.Thread(target=_pipe_output, args=(proc, rate_limit_info), daemon=True)
     t.start()
     return proc, rate_limit_info
@@ -359,15 +359,16 @@ def main():
             doc_path = Path(r'C:\bin\foreman\FOREMAN.md')
         else:
             doc_path = Path(__file__).resolve().parent / 'FOREMAN.md'
-        print(doc_path.read_text() if doc_path.exists() else f'FOREMAN.md not found at {doc_path}')
+        print(doc_path.read_text(encoding='utf-8') if doc_path.exists() else f'FOREMAN.md not found at {doc_path}')
         return
 
     # ------------------------------------------------------------------
     # Verify ralph is available
     # ------------------------------------------------------------------
     try:
-        r = subprocess.run(['ralph', '--version'], capture_output=True, text=True, timeout=10)
-        ralph_version = (r.stdout + r.stderr).strip()
+        r = subprocess.run(['ralph', '--version'], capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=10)
+        ralph_version = ((r.stdout or '') + (r.stderr or '')).strip()
         log(f"ralph version: {ralph_version} ✓")
     except FileNotFoundError:
         log("ERROR: 'ralph' not found in PATH.")

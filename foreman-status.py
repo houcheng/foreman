@@ -64,7 +64,7 @@ def show_done(done_dir: Path):
         print(f"  {d.name}")
         print(f"  {ts.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
-        content = tasks_file.read_text()
+        content = tasks_file.read_text(encoding='utf-8')
         for line in content.splitlines():
             m = task_line.match(line)
             if m:
