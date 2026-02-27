@@ -16,7 +16,7 @@ Or use the `/ralph-tui-prd` skill in Claude to generate one.
 
 **2. Number it:**
 ```bash
-python foreman-prepare.py
+foreman-prepare
 # tasks/prd-cloud-sync.md → tasks/prd-07-cloud-sync.md
 # US-x → US-007, US-008, ...
 ```
@@ -26,21 +26,27 @@ python foreman-prepare.py
 ln -s ../tasks/prd-07-cloud-sync.md todo/prd-07-cloud-sync.md
 ```
 
-**4. Run foreman:**
+**4. Run foreman-run:**
 ```bash
-python foreman-run.py
+foreman-run
 ```
 
 Foreman loops indefinitely, picking up queued PRDs, launching ralph, polling until done, archiving the result, and moving to the next. Press **Ctrl+C** to stop — any running ralph job continues unaffected.
+Runs in a server desktop's terminal or nohup.
 
 ## Options
 
-### foreman-prepare.py
+### foreman-prepare
 ```
 --dir DIR    Directory to scan (default: tasks)
 ```
 
-### foreman-run.py
+### foreman-statusy
+```
+--done-dir DIR   Directory of completed archives (default: done)
+```
+
+### foreman-run
 ```
 --poll-interval N     Seconds between todo/ scans (default: 5)
 --status-interval N   Seconds between ralph --status polls (default: 30)
