@@ -2,9 +2,10 @@
 """
 foreman-status.py
 
-Shows a summary of ralph task history:
+Shows a summary of completed and active task history:
   - If .ralph/ralph-tasks.md exists, runs 'ralph --status --tasks' to show active loop status
-  - Lists all completed ralph runs in done/ in chronological order with their tasks
+  - Lists all completed ralph runs (done/*-ralph-*/ralph-tasks.md)
+  - Lists all completed claude todo/plan runs (done/*-claude-*/status.md)
 
 Usage:
     python foreman-status.py [--done-dir done]
@@ -37,12 +38,10 @@ def show_done(done_dir: Path):
     ts_pattern = re.compile(r'(\d{8}-\d{6})$')
     task_line  = re.compile(r'^\s*-\s*\[(.)\]\s*(.*)')
 
-    entries = []
+    entries = []  # (ts, dir, kind, content_file)
+
     for d in done_dir.iterdir():
         if not d.is_dir():
-            continue
-        tasks_file = d / 'ralph-tasks.md'
-        if not tasks_file.exists():
             continue
         m = ts_pattern.search(d.name)
         if not m:
@@ -51,40 +50,56 @@ def show_done(done_dir: Path):
             ts = datetime.strptime(m.group(1), '%Y%m%d-%H%M%S')
         except ValueError:
             continue
-        entries.append((ts, d, tasks_file))
+
+        ralph_tasks = d / 'ralph-tasks.md'
+        status_md   = d / 'status.md'
+
+        if ralph_tasks.exists():
+            entries.append((ts, d, 'ralph', ralph_tasks))
+        elif status_md.exists():
+            entries.append((ts, d, 'todo', status_md))
 
     if not entries:
-        print("No completed ralph runs found in done/")
+        print("No completed runs found in done/")
         return
 
     entries.sort(key=lambda x: x[0])
 
-    for ts, d, tasks_file in entries:
+    for ts, d, kind, content_file in entries:
         print(f"\n{'='*60}")
         print(f"  {d.name}")
         print(f"  {ts.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
-        content = tasks_file.read_text(encoding='utf-8')
-        for line in content.splitlines():
-            m = task_line.match(line)
-            if m:
-                mark, text = m.group(1), m.group(2)
-                if mark == 'x':
-                    status = '[x]'
-                elif mark == '/':
-                    status = '[/]'
-                else:
-                    status = '[ ]'
-                print(f"  {status} {text}")
+        content = content_file.read_text(encoding='utf-8')
+
+        if kind == 'ralph':
+            for line in content.splitlines():
+                m = task_line.match(line)
+                if m:
+                    mark, text = m.group(1), m.group(2)
+                    if mark == 'x':
+                        status = '[x]'
+                    elif mark == '/':
+                        status = '[/]'
+                    else:
+                        status = '[ ]'
+                    print(f"  {status} {text}")
+
+        else:  # todo/plan task — show status.md key fields
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith('**') or stripped.startswith('#'):
+                    print(f"  {stripped}")
+
     print()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Report ralph task history: active loop status and completed runs.'
+        description='Report task history: active loop status and completed runs.'
     )
     parser.add_argument('--done-dir', default='done',
-                        help='Directory of completed ralph archives (default: done)')
+                        help='Directory of completed archives (default: done)')
     args = parser.parse_args()
 
     show_done(Path(args.done_dir))

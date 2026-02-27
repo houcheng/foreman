@@ -2,17 +2,30 @@
 """
 foreman-run.py
 
-Monitors todo/ for PRD symlinks matching prd-{number}-{anything}.md.
-When a new one appears, runs ralph in --tasks mode, polls completion,
-then archives the .ralph/ state to done/.
+Monitors todo/ for task files and runs them automatically.
 
-Workflow:
+Supported task types
+--------------------
+prd-{number}-{anything}.md   → runs via ralph (--tasks mode)
+todo-{anything}.md           → runs via claude (two-pass: implement + verify)
+plan-{anything}.md           → runs via claude (two-pass: implement + verify)
+
+Workflow (PRD):
     1. User runs: python foreman-prepare.py   (numbers PRDs and user stories in tasks/)
     2. User symlinks: ln -s ../tasks/prd-07-xxx.md todo/prd-07-xxx.md
     3. This script detects the symlink → runs ralph
     4. Polls: ralph --status --tasks until Progress N/N complete
     5. Archives .ralph/ → done/prd-07-xxx-ralph-YYYYMMDD-HHMMSS/
     6. Removes symlink from todo/
+
+Workflow (todo/plan):
+    1. User runs: foreman-add  (creates tasks/todo-xxx.md and symlinks todo/)
+       or manually places a plan-xxx.md symlink in todo/
+    2. This script detects the symlink → runs two claude passes:
+       Pass 1 — "read the FILE and implement it. Output <prompt>COMPLETE</prompt> when done."
+       Pass 2 — "read FILE listing what we implemented. Check if done, output <prompt>COMPLETE</prompt>."
+    3. Archives log → done/todo-xxx-claude-YYYYMMDD-HHMMSS/
+    4. Removes symlink from todo/
 
 Run from project root (same dir as .ralph/, tasks/, todo/, done/).
 
@@ -43,6 +56,12 @@ DEFAULT_AGENT           = 'claude-code'
 
 # Matches prd-{one_or_more_digits}-{anything}.md
 PRD_PATTERN = re.compile(r'^prd-(\d+)-.+\.md$')
+
+# Matches todo-{anything}.md and plan-{anything}.md (direct-claude tasks)
+TODO_TASK_PATTERN = re.compile(r'^(todo|plan)-.+\.md$')
+
+# Signal that claude must output when the task is complete
+COMPLETE_SIGNAL = '<prompt>COMPLETE</prompt>'
 
 TODO_DIR  = Path('todo')
 DONE_DIR  = Path('done')
@@ -82,17 +101,39 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding='utf-8')
 
 
+def extract_passes(name: str, default: int = 1) -> int:
+    """Extract pass count encoded in a symlink name.
+
+    todo-slug.p2.md  → 2
+    todo-slug.md     → default (1)
+    """
+    m = re.search(r'\.p(\d+)\.md$', name)
+    return int(m.group(1)) if m else default
+
+
 def scan_todo() -> list:
-    """Return PRD paths in todo/ matching the pattern, sorted by prd number."""
+    """Return queued task paths in todo/ as (path, job_type) tuples.
+
+    PRDs (job_type='prd') come first, sorted by number.
+    Todo/plan files (job_type='todo') follow, sorted by modification time.
+    Broken symlinks are skipped.
+    """
     if not TODO_DIR.exists():
         return []
-    entries = []
+    prds  = []
+    todos = []
     for p in TODO_DIR.iterdir():
+        if not p.exists():   # .exists() follows symlinks; broken links → False
+            continue
         m = PRD_PATTERN.match(p.name)
-        if m and p.exists():   # .exists() follows symlinks, so broken links are skipped
-            entries.append((int(m.group(1)), p))
-    entries.sort(key=lambda x: x[0])
-    return [p for _, p in entries]
+        if m:
+            prds.append((int(m.group(1)), p))
+            continue
+        if TODO_TASK_PATTERN.match(p.name):
+            todos.append((p.stat().st_mtime, p))
+    prds.sort(key=lambda x: x[0])
+    todos.sort(key=lambda x: x[0])
+    return [(p, 'prd') for _, p in prds] + [(p, 'todo') for _, p in todos]
 
 
 def get_ralph_status() -> str:
@@ -157,6 +198,31 @@ def archive_ralph_state(prd_name: str) -> Path | None:
     dest    = DONE_DIR / f'{stem}-ralph-{ts_str}'
     shutil.move(str(RALPH_DIR), str(dest))
     log(f"Archived .ralph/ → {dest}/")
+    return dest
+
+
+def archive_todo_result(task_path: Path, success: bool, log_file: Path | None) -> Path:
+    """Archive todo/plan task results to done/{stem}-claude-{timestamp}/"""
+    DONE_DIR.mkdir(exist_ok=True)
+    stem   = task_path.name.removesuffix('.md')
+    ts_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+    dest   = DONE_DIR / f'{stem}-claude-{ts_str}'
+    dest.mkdir(exist_ok=True)
+
+    status_text = 'COMPLETE' if success else 'INCOMPLETE'
+    status_file = dest / 'status.md'
+    status_file.write_text(
+        f"# Task Status\n\n"
+        f"**Task:** {task_path.name}\n"
+        f"**Status:** {status_text}\n"
+        f"**Completed:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        encoding='utf-8',
+    )
+
+    if log_file and log_file.exists():
+        shutil.move(str(log_file), str(dest / log_file.name))
+
+    log(f"Archived todo task → {dest}/")
     return dest
 
 
@@ -232,6 +298,20 @@ def _pipe_output(proc, rate_limit_info: dict):
         pass
 
 
+def _pipe_claude_output(proc, output_info: dict, log_file: Path):
+    """Echo claude stdout to terminal and log file; detect COMPLETE signal."""
+    try:
+        with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                f.write(line)
+                if COMPLETE_SIGNAL in line:
+                    output_info['complete'] = True
+    except Exception:
+        pass
+
+
 def start_ralph(prd_path: Path, max_iterations: int, agent: str,
                 model: str = '', no_allow_all: bool = False,
                 extra_ralph_flags: list = []):
@@ -258,6 +338,55 @@ def start_ralph(prd_path: Path, max_iterations: int, agent: str,
     t = threading.Thread(target=_pipe_output, args=(proc, rate_limit_info), daemon=True)
     t.start()
     return proc, rate_limit_info
+
+
+def start_claude_pass(task_path: Path, pass_num: int, log_file: Path,
+                      allow_all: bool = True, verify: bool = False,
+                      total_passes: int = 1) -> tuple:
+    """Spawn claude for an implementation or verification pass.
+
+    verify=False (default): implement prompt — "read FILE and implement it."
+    verify=True:            check prompt    — "read FILE and verify all is done."
+    """
+    if verify:
+        prompt = (
+            f"read {task_path} that lists the functions/features we've implemented. "
+            f"Check whether everything described is done and output `{COMPLETE_SIGNAL}`."
+        )
+        pass_label = 'verify'
+    else:
+        prompt = (
+            f"read the {task_path} and implement it. "
+            f"When it is all done output `{COMPLETE_SIGNAL}`."
+        )
+        pass_label = 'implement'
+
+    cmd = ['claude', '--print']
+    if allow_all:
+        cmd += ['--dangerously-skip-permissions']
+    cmd += [prompt]
+
+    # Write a header section to the log before starting
+    with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"Pass {pass_num}/{total_passes} ({pass_label}) — "
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Prompt: {prompt}\n")
+        f.write(f"{'='*60}\n\n")
+
+    log(f"Starting claude pass {pass_num}/{total_passes} [{pass_label}] for {task_path.name}")
+
+    output_info: dict = {'complete': False}
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding='utf-8', errors='replace', bufsize=1,
+    )
+    t = threading.Thread(
+        target=_pipe_claude_output, args=(proc, output_info, log_file), daemon=True
+    )
+    t.start()
+    return proc, output_info
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +446,19 @@ def main():
             '    5. Polls "ralph --status --tasks" every N seconds until all tasks complete\n'
             '    6. Archives .ralph/ state  →  done/prd-07-my-feature-ralph-<ts>/\n'
             '    7. Removes the todo/ symlink, then loops back to check for the next PRD\n'
+            '\n'
+            'Todo/plan workflow:\n'
+            '\n'
+            '  You do (once per task):\n'
+            '    1. foreman-add            (creates tasks/todo-xxx.md and todo/ symlink)\n'
+            '       or: ln -s ../tasks/plan-xxx.md todo/plan-xxx.md\n'
+            '\n'
+            '  This script does the rest automatically:\n'
+            '    2. Detects todo-*.md / plan-*.md in todo/\n'
+            '    3. Pass 1: claude --print "read FILE and implement it ..."\n'
+            '    4. Pass 2: claude --print "read FILE and verify completion ..."\n'
+            '    5. Archives log → done/{name}-claude-<ts>/\n'
+            '    6. Removes the todo/ symlink\n'
             '\n'
             'Run from the project root (same directory as tasks/, todo/, done/, .ralph/).'
         ),
@@ -401,13 +543,21 @@ def main():
     current_rate_limit_info: dict = {}
     last_status_check = 0.0
 
+    # State for todo/plan (direct-claude) jobs
+    current_job_type:    str | None  = None   # 'prd' or 'todo'
+    current_pass:        int         = 0      # which pass we're on (1-based)
+    current_num_passes:  int         = 1      # total passes for this task (from symlink name)
+    current_task_log:    Path | None = None   # log file for todo jobs
+    current_task_output: dict        = {}     # output_info from start_claude_pass
+
     # ------------------------------------------------------------------
     # Graceful shutdown
     # ------------------------------------------------------------------
     def shutdown(signum, frame):
         log("Interrupt received. Shutting down monitor.")
         if current_proc and current_proc.poll() is None:
-            log(f"Ralph (pid {current_proc.pid}) is still running — NOT killed.")
+            agent_name = 'Ralph' if current_job_type == 'prd' else 'Claude'
+            log(f"{agent_name} (pid {current_proc.pid}) is still running — NOT killed.")
             log("Re-run this monitor to resume tracking it, or check manually.")
             if current_prd:
                 state['in_progress'] = str(current_prd)
@@ -421,117 +571,191 @@ def main():
     # On restart: check if a previous session left an in-progress job
     # ------------------------------------------------------------------
     if state.get('in_progress'):
-        prev = Path(state['in_progress'])
-        log(f"Previous session had in-progress job: {prev.name}")
-        status = get_ralph_status()
+        prev     = Path(state['in_progress'])
+        job_type = state.get('job_type', 'prd')
+        log(f"Previous session had in-progress job: {prev.name} (type: {job_type})")
 
-        if is_all_complete(status):
-            # Ralph finished while the monitor was down — clean up now
-            log("Ralph completed while monitor was offline. Cleaning up.")
-            prog = parse_progress(status)
-            done_n, total_n = prog if prog else (0, 0)
-            handle_finished_job(prev, state, success=True, done=done_n, total=total_n)
-
-        elif is_no_active_loop(status):
-            # Ralph stopped without completing
-            prog = parse_progress(status)
-            if prog:
-                d, t = prog
-                log(f"Ralph stopped at {d}/{t} tasks. Not all done.")
-            else:
-                log("Ralph stopped; could not determine progress.")
-            handle_finished_job(prev, state, success=False,
-                                 done=prog[0] if prog else 0,
-                                 total=prog[1] if prog else 0)
+        if job_type == 'todo':
+            # Cannot resume a todo/plan job mid-pass; restart from pass 1 via symlink
+            log("Cannot resume todo job mid-pass. Will restart it from pass 1.")
+            state['in_progress'] = None
+            save_state(state)
+            # The symlink should still exist in todo/ so the main loop will pick it up
 
         else:
-            # Ralph appears to still be running in another terminal
-            log("Ralph still appears to be running. Will monitor via --status polling.")
-            current_prd = prev
-            # current_proc stays None — we'll use --status to detect completion
+            # PRD job: check ralph status
+            status = get_ralph_status()
+
+            if is_all_complete(status):
+                # Ralph finished while the monitor was down — clean up now
+                log("Ralph completed while monitor was offline. Cleaning up.")
+                prog = parse_progress(status)
+                done_n, total_n = prog if prog else (0, 0)
+                handle_finished_job(prev, state, success=True, done=done_n, total=total_n)
+
+            elif is_no_active_loop(status):
+                # Ralph stopped without completing
+                prog = parse_progress(status)
+                if prog:
+                    d, t = prog
+                    log(f"Ralph stopped at {d}/{t} tasks. Not all done.")
+                else:
+                    log("Ralph stopped; could not determine progress.")
+                handle_finished_job(prev, state, success=False,
+                                     done=prog[0] if prog else 0,
+                                     total=prog[1] if prog else 0)
+
+            else:
+                # Ralph appears to still be running in another terminal
+                log("Ralph still appears to be running. Will monitor via --status polling.")
+                current_prd      = prev
+                current_job_type = 'prd'
+                # current_proc stays None — we'll use --status to detect completion
 
     # ------------------------------------------------------------------
     # Main watch loop
     # ------------------------------------------------------------------
     log(f"Watching {TODO_DIR}/ every {args.poll_interval}s  "
         f"(ralph status check every {args.status_interval}s) ...")
-    log("Press Ctrl+C to stop (any active ralph job will keep running).")
+    log("Press Ctrl+C to stop (any active job will keep running).")
 
     while True:
         now = time.time()
 
-        # ── A. Spawned ralph process finished ──────────────────────────────
+        # ── A. Spawned process finished ────────────────────────────────────
         if current_proc is not None and current_proc.poll() is not None:
             exit_code = current_proc.returncode
-            log(f"Ralph exited (exit code {exit_code})")
 
-            status  = get_ralph_status()
-            prog    = parse_progress(status)
-            done_n, total_n = prog if prog else (0, 0)
-            success = is_all_complete(status)
+            # ── A-todo: direct-claude job ──────────────────────────────────
+            if current_job_type == 'todo':
+                complete = current_task_output.get('complete', False)
+                log(f"Claude pass {current_pass}/{current_num_passes} exited "
+                    f"(exit code {exit_code}), COMPLETE={'yes' if complete else 'no'}")
 
-            # ── Rate limit: wait until reset, then resume (doesn't count as retry) ──
-            if current_rate_limit_info.get('detected'):
-                reset_dt = current_rate_limit_info.get('reset_time')
-                if reset_dt:
-                    wait_secs = max((reset_dt - datetime.now(reset_dt.tzinfo)).total_seconds() + 60, 0)
-                    log(f"Waiting {int(wait_secs // 60)}m {int(wait_secs % 60)}s for rate limit reset...")
-                    time.sleep(wait_secs)
-                else:
-                    log("Rate limit hit (unknown reset time). Waiting 60 minutes...")
-                    time.sleep(3600)
-                log("Resuming after rate limit reset.")
-                current_proc, current_rate_limit_info = start_ralph(
-                    current_prd, args.max_iterations, args.agent,
-                    model=args.model,
-                    no_allow_all=args.no_allow_all, extra_ralph_flags=args.extra_ralph_flags)
-                last_status_check = now
+                if current_pass < current_num_passes:
+                    # More passes to run
+                    if not complete:
+                        log(f"WARNING: Pass {current_pass} did not output COMPLETE signal.")
+                    current_pass += 1
+                    is_verify  = (current_pass == current_num_passes and current_num_passes > 1)
+                    pass_label = 'verify' if is_verify else 'implement'
+                    log(f"Starting pass {current_pass}/{current_num_passes} [{pass_label}]...")
+                    current_proc, current_task_output = start_claude_pass(
+                        current_prd, current_pass, current_task_log,
+                        allow_all=not args.no_allow_all,
+                        verify=is_verify,
+                        total_passes=current_num_passes,
+                    )
 
-            elif not success and exit_code == 0:
-                retry_count = state.get('retry_count', 0) + 1
-                max_retries = args.max_retries
-                if max_retries == 0 or retry_count <= max_retries:
-                    state['retry_count'] = retry_count
+                else:  # all passes done
+                    success = complete
+                    if current_num_passes > 1:
+                        # last pass was a verify pass
+                        if success:
+                            log(f"Verification complete for {current_prd.name}!")
+                        else:
+                            log(f"WARNING: Verification pass did not confirm completion "
+                                f"for {current_prd.name}.")
+                    else:
+                        if success:
+                            log(f"Task complete for {current_prd.name}!")
+                        else:
+                            log(f"WARNING: Task pass did not output COMPLETE "
+                                f"for {current_prd.name}.")
+                    archive_todo_result(current_prd, success, current_task_log)
+                    remove_symlink(current_prd)
+                    state['in_progress'] = None
                     save_state(state)
-                    retry_label = f"{retry_count}/{max_retries}" if max_retries else f"{retry_count}/∞"
-                    log(f"Tasks incomplete ({done_n}/{total_n}). Auto-retrying [{retry_label}]...")
-                    current_proc, current_rate_limit_info = start_ralph(
-                        current_prd, args.max_iterations, args.agent,
-                        model=args.model,
-                        no_allow_all=args.no_allow_all, extra_ralph_flags=args.extra_ralph_flags)
-                    last_status_check = now
-                else:
-                    log(f"Max retries ({max_retries}) reached. Giving up on {current_prd.name}.")
-                    handle_finished_job(current_prd, state, success=False,
-                                        done=done_n, total=total_n)
-                    current_proc = None
-                    current_prd  = None
-            elif exit_code != 0:
-                error_retry_count = state.get('error_retry_count', 0) + 1
-                max_err = args.max_error_retries
-                if max_err > 0 and error_retry_count <= max_err:
-                    state['error_retry_count'] = error_retry_count
-                    save_state(state)
-                    log(f"Ralph error (exit {exit_code}). Retrying [{error_retry_count}/{max_err}]...")
-                    current_proc, current_rate_limit_info = start_ralph(
-                        current_prd, args.max_iterations, args.agent,
-                        model=args.model,
-                        no_allow_all=args.no_allow_all, extra_ralph_flags=args.extra_ralph_flags)
-                    last_status_check = now
-                else:
-                    log(f"Ralph error (exit {exit_code}), max error retries ({max_err}) reached.")
-                    handle_finished_job(current_prd, state, success=False,
-                                        done=done_n, total=total_n)
-                    current_proc = None
-                    current_prd  = None
+                    current_proc        = None
+                    current_prd         = None
+                    current_job_type    = None
+                    current_pass        = 0
+                    current_num_passes  = 1
+                    current_task_log    = None
+                    current_task_output = {}
+
+            # ── A-prd: ralph job ───────────────────────────────────────────
             else:
-                handle_finished_job(current_prd, state, success=True,
-                                     done=done_n, total=total_n)
-                current_proc = None
-                current_prd  = None
+                log(f"Ralph exited (exit code {exit_code})")
 
-        # ── B. Monitoring a resumed job (no process handle) ────────────────
-        elif current_prd is not None and current_proc is None:
+                status  = get_ralph_status()
+                prog    = parse_progress(status)
+                done_n, total_n = prog if prog else (0, 0)
+                success = is_all_complete(status)
+
+                # Rate limit: wait until reset, then resume (doesn't count as retry)
+                if current_rate_limit_info.get('detected'):
+                    reset_dt = current_rate_limit_info.get('reset_time')
+                    if reset_dt:
+                        wait_secs = max(
+                            (reset_dt - datetime.now(reset_dt.tzinfo)).total_seconds() + 60, 0
+                        )
+                        log(f"Waiting {int(wait_secs // 60)}m {int(wait_secs % 60)}s "
+                            f"for rate limit reset...")
+                        time.sleep(wait_secs)
+                    else:
+                        log("Rate limit hit (unknown reset time). Waiting 60 minutes...")
+                        time.sleep(3600)
+                    log("Resuming after rate limit reset.")
+                    current_proc, current_rate_limit_info = start_ralph(
+                        current_prd, args.max_iterations, args.agent,
+                        model=args.model,
+                        no_allow_all=args.no_allow_all,
+                        extra_ralph_flags=args.extra_ralph_flags)
+                    last_status_check = now
+
+                elif not success and exit_code == 0:
+                    retry_count = state.get('retry_count', 0) + 1
+                    max_retries = args.max_retries
+                    if max_retries == 0 or retry_count <= max_retries:
+                        state['retry_count'] = retry_count
+                        save_state(state)
+                        retry_label = (f"{retry_count}/{max_retries}"
+                                       if max_retries else f"{retry_count}/∞")
+                        log(f"Tasks incomplete ({done_n}/{total_n}). "
+                            f"Auto-retrying [{retry_label}]...")
+                        current_proc, current_rate_limit_info = start_ralph(
+                            current_prd, args.max_iterations, args.agent,
+                            model=args.model,
+                            no_allow_all=args.no_allow_all,
+                            extra_ralph_flags=args.extra_ralph_flags)
+                        last_status_check = now
+                    else:
+                        log(f"Max retries ({max_retries}) reached. "
+                            f"Giving up on {current_prd.name}.")
+                        handle_finished_job(current_prd, state, success=False,
+                                            done=done_n, total=total_n)
+                        current_proc = None
+                        current_prd  = None
+                elif exit_code != 0:
+                    error_retry_count = state.get('error_retry_count', 0) + 1
+                    max_err = args.max_error_retries
+                    if max_err > 0 and error_retry_count <= max_err:
+                        state['error_retry_count'] = error_retry_count
+                        save_state(state)
+                        log(f"Ralph error (exit {exit_code}). "
+                            f"Retrying [{error_retry_count}/{max_err}]...")
+                        current_proc, current_rate_limit_info = start_ralph(
+                            current_prd, args.max_iterations, args.agent,
+                            model=args.model,
+                            no_allow_all=args.no_allow_all,
+                            extra_ralph_flags=args.extra_ralph_flags)
+                        last_status_check = now
+                    else:
+                        log(f"Ralph error (exit {exit_code}), "
+                            f"max error retries ({max_err}) reached.")
+                        handle_finished_job(current_prd, state, success=False,
+                                            done=done_n, total=total_n)
+                        current_proc = None
+                        current_prd  = None
+                else:
+                    handle_finished_job(current_prd, state, success=True,
+                                         done=done_n, total=total_n)
+                    current_proc = None
+                    current_prd  = None
+
+        # ── B. Monitoring a resumed PRD job (no process handle) ────────────
+        elif current_prd is not None and current_proc is None and current_job_type == 'prd':
             if (now - last_status_check) >= args.status_interval:
                 status = get_ralph_status()
                 prog   = parse_progress(status)
@@ -544,44 +768,77 @@ def main():
                     handle_finished_job(current_prd, state, success=success,
                                         done=prog[0] if prog else 0,
                                         total=prog[1] if prog else 0)
-                    current_prd = None
+                    current_prd      = None
+                    current_job_type = None
                 last_status_check = now
 
-        # ── C. Status heartbeat while ralph is running (for logging) ───────
+        # ── C. Status heartbeat while a process is running ─────────────────
         elif current_proc is not None and current_proc.poll() is None:
             if (now - last_status_check) >= args.status_interval:
-                status = get_ralph_status()
-                prog   = parse_progress(status)
-                if prog:
-                    done_n, total_n = prog
-                    log(f"Status: {done_n}/{total_n} tasks complete "
-                        f"(ralph pid {current_proc.pid} running)")
+                if current_job_type == 'todo':
+                    log(f"Claude pass {current_pass}/{current_num_passes} still running "
+                        f"(pid {current_proc.pid})...")
+                else:
+                    status = get_ralph_status()
+                    prog   = parse_progress(status)
+                    if prog:
+                        done_n, total_n = prog
+                        log(f"Status: {done_n}/{total_n} tasks complete "
+                            f"(ralph pid {current_proc.pid} running)")
                 last_status_check = now
 
-        # ── D. Idle: scan todo/ for new PRDs ───────────────────────────────
+        # ── D. Idle: scan todo/ for new tasks ──────────────────────────────
         if current_proc is None and current_prd is None:
-            for prd_path in scan_todo():
-                # Safety: refuse to start if ralph's state file shows an active loop
-                if is_ralph_active():
-                    log(f"Skipping {prd_path.name}: ralph state file shows an active loop "
-                        f"({RALPH_DIR / 'ralph-loop.state.json'}). Will retry next poll.")
-                    break
+            for task_path, task_type in scan_todo():
 
-                # New PRD found — guard against stale .ralph/ first
-                backup_stale_ralph()
+                if task_type == 'prd':
+                    # Safety: refuse to start if ralph's state file shows an active loop
+                    if is_ralph_active():
+                        log(f"Skipping {task_path.name}: ralph state file shows an active loop "
+                            f"({RALPH_DIR / 'ralph-loop.state.json'}). Will retry next poll.")
+                        break
 
-                current_prd = prd_path
-                state['in_progress'] = str(prd_path)
-                state['retry_count'] = 0
-                state['error_retry_count'] = 0
-                save_state(state)
+                    # New PRD found — guard against stale .ralph/ first
+                    backup_stale_ralph()
 
-                current_proc, current_rate_limit_info = start_ralph(
-                    prd_path, args.max_iterations, args.agent,
-                    model=args.model,
-                    no_allow_all=args.no_allow_all, extra_ralph_flags=args.extra_ralph_flags)
-                last_status_check = now
-                break  # one at a time: remaining PRDs will be picked up next iteration
+                    current_prd      = task_path
+                    current_job_type = 'prd'
+                    state['in_progress']      = str(task_path)
+                    state['job_type']         = 'prd'
+                    state['retry_count']      = 0
+                    state['error_retry_count'] = 0
+                    save_state(state)
+
+                    current_proc, current_rate_limit_info = start_ralph(
+                        task_path, args.max_iterations, args.agent,
+                        model=args.model,
+                        no_allow_all=args.no_allow_all,
+                        extra_ralph_flags=args.extra_ralph_flags)
+                    last_status_check = now
+
+                else:  # 'todo' — direct-claude job
+                    stem             = task_path.name.removesuffix('.md')
+                    ts_str           = datetime.now().strftime('%Y%m%d-%H%M%S')
+                    DONE_DIR.mkdir(exist_ok=True)
+                    current_task_log = DONE_DIR / f'{stem}-{ts_str}.log'
+
+                    current_prd        = task_path
+                    current_job_type   = 'todo'
+                    current_pass       = 1
+                    current_num_passes = extract_passes(task_path.name)
+                    state['in_progress'] = str(task_path)
+                    state['job_type']    = 'todo'
+                    save_state(state)
+
+                    current_proc, current_task_output = start_claude_pass(
+                        task_path, 1, current_task_log,
+                        allow_all=not args.no_allow_all,
+                        verify=False,
+                        total_passes=current_num_passes,
+                    )
+                    last_status_check = now
+
+                break  # one at a time: remaining tasks picked up next iteration
 
         time.sleep(args.poll_interval)
 

@@ -1,26 +1,106 @@
 # How to Use Foreman
 
-## Overview: What Happens Under the Hood
+Foreman supports two task modes. Choose the one that fits your workflow.
+
+---
+
+## Mode A — Todo/Plan (direct claude, freeform)
+
+Use this for quick tasks, exploratory work, or when you don't need the full
+PRD/user-story structure.
+
+```
+foreman-add
+       │
+       ▼  prompts: title, requirements
+       │  writes:  tasks/todo-<slug>.md
+       │  creates: todo/todo-<slug>.md  (symlink)
+       │
+       ▼
+foreman-run (watching todo/)
+  - detects todo-<slug>.md
+  - Pass 1: claude --print "read the FILE and implement it.
+                             When done output <prompt>COMPLETE</prompt>."
+  - waits for COMPLETE signal in output
+  - Pass 2: claude --print "read FILE listing what we've implemented.
+                             Check if done, output <prompt>COMPLETE</prompt>."
+  - archives log → done/todo-<slug>-claude-<ts>/
+  - removes todo/ symlink, picks up next task
+```
+
+### Steps
+
+**Step 1 — Create and queue a task**
+
+```bash
+foreman-add
+```
+
+Example session:
+```
+=== Foreman Task Creator ===
+Job title: Add CSV export to the reports page
+Requirements (enter a blank line to finish):
+Export the current filtered view as UTF-8 CSV
+Include all visible columns with headers
+Filename should be reports-YYYY-MM-DD.csv
+
+Created:  tasks/todo-add-csv-export-to-the-reports-page.md
+Queued:   todo/todo-add-csv-export-to-the-reports-page.md → ../tasks/todo-...md
+```
+
+Or seed from an existing plan file:
+```bash
+foreman-add -f plan-csv-export.md
+```
+
+**Step 2 — Run foreman-run**
+
+```bash
+foreman-run
+```
+
+Foreman detects the symlink and runs claude twice (implement then verify).
+The full output is logged to `done/todo-<slug>-claude-<ts>/<slug>.log`.
+
+**Step 3 — Check status**
+
+```bash
+foreman-status
+```
+
+Shows completed runs. For todo tasks, shows the `status.md` (COMPLETE / INCOMPLETE).
+
+To inspect the full log:
+```bash
+cat done/todo-add-csv-export-to-the-reports-page-claude-20260227-143000/*.log
+```
+
+---
+
+## Mode B — PRD (ralph-driven, structured user stories)
+
+Use this for larger features where you want to break work into user stories
+that are tracked and resumed automatically.
 
 ```
 You write a PRD
        │
        ▼
-foreman-prepare.py --link
+foreman-prepare --link
   - renames tasks/prd-my-feature.md → tasks/prd-07-my-feature.md
   - renumbers US-x placeholders → US-007, US-008, ...
-  - (with --link) creates todo/prd-07-my-feature.md → symlink
+  - creates todo/prd-07-my-feature.md symlink
        │
        ▼
-foreman-run.py (watching todo/)
-  - detects the symlink
-  - launches:  ralph --file todo/prd-07-my-feature.md --tasks --agent claude-code
+foreman-run (watching todo/)
+  - detects prd-07-my-feature.md
+  - launches: ralph --file todo/prd-07-my-feature.md --tasks --agent claude-code
        │
        ▼
 ralph (loop driver)
-  - iteration 1: sends the entire PRD as a prompt to claude-code
-                 tells it: "create .ralph/ralph-tasks.md with a - [ ] task list"
-  - iteration 2+: reads .ralph/ralph-tasks.md, tells claude-code which task is next
+  - iteration 1: sends PRD to claude-code, asks it to write .ralph/ralph-tasks.md
+  - iteration 2+: reads tasks, tells claude-code which task is next
   - detects <promise>READY_FOR_NEXT_TASK</promise> to advance
   - detects <promise>COMPLETE</promise> to stop
        │
@@ -31,29 +111,23 @@ claude-code (the AI, doing real work)
         - [ ] Implement US-007 upload to Dropbox
         - [ ] Implement US-008 restore from backup
   - works through tasks one by one, marking [/] then [x]
-  - outputs the promise signals when done
        │
        ▼
-foreman-run.py (on completion)
+foreman-run (on completion)
   - archives .ralph/ → done/prd-07-my-feature-ralph-<ts>/
-  - moves stream log → done/prd-07-my-feature-stream-<ts>.log
-  - removes todo/ symlink, waits for next PRD
+  - removes todo/ symlink, picks up next PRD
 ```
 
 **Key point:** Ralph never parses your PRD. It passes the whole file as a prompt to
 claude-code. Claude-code reads it, understands the user stories, and writes the task
 list in `.ralph/ralph-tasks.md`. Ralph only tracks the checkboxes.
 
----
+### Steps
 
-## Steps
+**Step 1 — Write your PRD**
 
-### Step 1 — Write your PRD
-
-Create `tasks/prd-my-feature.md` (no number yet, must start with `prd-`).
-
-Use `US-1`, `US-2`, ... (any digit) as placeholders — foreman-prepare will assign
-globally unique numbers later.
+Create `tasks/prd-my-feature.md` (must start with `prd-`, no number yet).
+Use `US-1`, `US-2`, ... as placeholders — foreman-prepare assigns globally unique IDs.
 
 ```markdown
 # My Feature
@@ -65,112 +139,45 @@ Describe the story here.
 Describe the story here.
 ```
 
-Or generate it with Claude:
-
+Or generate it with the Claude skill:
 ```
 /ralph-tui-prd
-
-Please describe the feature you want to build...
-[answer questions]
-
-Write the PRD to tasks/prd-my-feature.md
 ```
 
-### Step 2 — Prepare and queue
+**Step 2 — Prepare and queue**
 
 ```bash
-python foreman-prepare.py --link
+foreman-prepare --link
 ```
 
 This does everything in one step:
 - Renames `tasks/prd-my-feature.md` → `tasks/prd-07-my-feature.md`
 - Replaces `US-1`, `US-2` with globally unique IDs (e.g. `US-007`, `US-008`)
-- Creates `todo/prd-07-my-feature.md` symlink (because of `--link`)
+- Creates `todo/prd-07-my-feature.md` symlink
 
-### Step 3 — Start the runner
+**Step 3 — Run foreman-run**
 
 ```bash
-python foreman-run.py
+foreman-run
 ```
 
-Leave it running. It picks up todo/ symlinks automatically and processes them
-one at a time. You can queue multiple PRDs before or during the run.
+Leave it running. It picks up todo/ symlinks automatically, processing one at a time.
+You can queue multiple PRDs before or during the run.
 
-### Monitor progress (separate terminal, from project root)
+**Monitor progress (separate terminal, from project root)**
 
 ```bash
-ralph --status --tasks    # show loop state + current task list
-ralph --list-tasks        # task list only
+ralph --status --tasks    # loop state + current task list
 cat .ralph/ralph-tasks.md # raw task file
 ```
 
-### After a PRD completes
+**After a PRD completes**
 
-`foreman-run.py` automatically archives `.ralph/` to `done/`:
+`foreman-run` automatically archives `.ralph/` to `done/`:
 
 ```
 .ralph/  →  done/prd-07-my-feature-ralph-20260225-143000/
 ```
-
-So `ralph --status --tasks` may show the completed tasks right after finishing,
-but the next call finds nothing because `.ralph/` has been moved. The tasks are
-not deleted — find them in `done/`:
-
-```bash
-cat done/prd-07-my-feature-ralph-20260225-143000/ralph-tasks.md
-```
-
-### How foreman-run guards against starting a duplicate ralph job
-
-There is no lock file. Ralph does not create one. The guard is the state JSON:
-
-1. **`is_ralph_active()`** — reads `.ralph/ralph-loop.state.json` and checks
-   `"active": true`. If true, foreman-run skips the PRD and retries next poll.
-
-2. **`backup_stale_ralph()`** — if `.ralph/` exists but `active` is false
-   (crashed or killed run), moves the whole directory to `done/stale-ralph-<ts>/`
-   before starting fresh.
-
-Known gap: if ralph is running but its state file is mid-write or corrupted,
-`is_ralph_active()` returns false and foreman-run may incorrectly start a second
-ralph on the same project directory.
-
-### How claude-code handles an existing `ralph-tasks.md`
-
-**Q: Does claude-code rewrite the task file on every iteration?**
-No. From iteration 2 onward, ralph injects the current `ralph-tasks.md` contents
-into the prompt and tells claude-code which task is current. Claude-code is only
-expected to update the status of the current task (`[ ]` → `[/]` → `[x]`), not
-rewrite the whole file.
-
-**Q: What if `.ralph/ralph-tasks.md` already exists when ralph starts (e.g. resuming)?**
-Ralph uses it as-is from iteration 1. It does not clear or overwrite it on start.
-Claude-code sees the existing tasks — including already-completed `[x]` ones — and
-continues from where it left off. This is the intended resume mechanism.
-
-**Q: Can a leftover `ralph-tasks.md` from a previous PRD confuse the next one?**
-Yes. If `.ralph/ralph-tasks.md` has the old PRD's completed tasks, claude-code on
-iteration 1 sees "all tasks complete" and immediately outputs `COMPLETE` without
-doing any new work. This is why `foreman-run.py` calls `backup_stale_ralph()` before
-every new job — it moves the whole `.ralph/` out of the way first. Running
-`foreman-prepare --clean-ralph` manually before queuing a new PRD avoids this too.
-
-### The "⏳ working..." heartbeat
-
-```
-⏳ working... elapsed 2:40 · last activity 0:16 ago
-```
-
-This is printed by **ralph** (not foreman, not claude-code). It fires every 10 seconds
-when claude-code has produced no output in that window. It means:
-
-- **elapsed** — time since this iteration started
-- **last activity** — how long ago claude-code last printed anything
-
-It is a silence detector, not an error. Claude-code is still running; it's just thinking
-or doing something that produces no output (e.g. a long file read, a large edit).
-If "last activity" climbs past several minutes, the agent may be stuck — check with
-`ralph --status --tasks` in another terminal.
 
 ### Inject hints mid-run
 
@@ -198,95 +205,82 @@ Useful when iterating on a single PRD without the full foreman pipeline.
 
 ## Appendix
 
-### A. How foreman-prepare.py matches user stories
+### A. Directory layout
 
-`foreman-prepare.py` uses this regex to find and renumber user story IDs:
+```
+tasks/
+  prd-07-cloud-sync.md         ← numbered PRD
+  todo-add-csv-export.md       ← todo task (created by foreman-add)
+  plan-refactor-auth.md        ← plan file (manually created)
 
-```python
-us_pattern = re.compile(r"US-(\d+)", re.IGNORECASE)
+todo/
+  prd-07-cloud-sync.md         ← symlink → ../tasks/prd-07-cloud-sync.md
+  todo-add-csv-export.md       ← symlink → ../tasks/todo-add-csv-export.md
+
+done/
+  prd-07-cloud-sync-ralph-20260225-143000/    ← archived .ralph/ state
+    ralph-tasks.md
+    ralph-loop.state.json
+    ...
+  todo-add-csv-export-claude-20260227-100000/ ← archived claude session
+    status.md                                 ← COMPLETE or INCOMPLETE
+    todo-add-csv-export-20260227-100000.log   ← full claude output
+
+.ralph/
+  ralph-loop.state.json   ← active ralph state (cleared on archive)
+  ralph-tasks.md
 ```
 
-It matches `US-` followed by **one or more digits**. Examples:
+### B. How foreman-run guards against starting a duplicate ralph job
 
-| Text in your PRD | Matches? |
-|---|---|
-| `## US-1  Upload files` | YES → renumbered to `US-007` |
-| `## US-001  Upload files` | YES → renumbered to `US-007` |
-| `### US-003  Upload files` | YES → renumbered to `US-007` |
-| `## US-x  Upload files` | **NO** — `x` is not a digit |
+1. **`is_ralph_active()`** — reads `.ralph/ralph-loop.state.json` and checks
+   `"active": true`. If true, foreman-run skips the PRD and retries next poll.
 
-The script only renumbers stories in **newly renamed files** (files that just got their
-`prd-NN-` prefix assigned in this run). Already-numbered PRDs are only scanned to find
-the current max ID so new IDs continue from there.
+2. **`backup_stale_ralph()`** — if `.ralph/` exists but `active` is false
+   (crashed or killed run), moves the whole directory to `done/stale-ralph-<ts>/`
+   before starting fresh.
 
-### B. Why `### US-003` stories are not picked up by ralph
+### C. The "⏳ working..." heartbeat (PRD mode only)
 
-Writing `### US-003` is fine for foreman-prepare (it matches the regex above).
-The problem is elsewhere in the pipeline.
-
-**Ralph does not parse your PRD.** The entire PRD file is passed verbatim as the
-prompt text to claude-code. On iteration 1, ralph's prompt says:
-
-> "TASKS MODE: (no tasks found)
-> Create .ralph/ralph-tasks.md with your task list."
-
-Claude-code reads your PRD, understands the user stories, and must write them
-as checkboxes in `.ralph/ralph-tasks.md`:
-
-```markdown
-- [ ] US-003 implement login page
-- [ ] US-004 add logout button
+```
+⏳ working... elapsed 2:40 · last activity 0:16 ago
 ```
 
-Ralph only tracks the `- [ ]` / `- [/]` / `- [x]` format. If `ralph-tasks.md`
-is empty or has no checkboxes, ralph reports "no tasks found" and loops without
-making progress.
+Printed by ralph every 10 seconds when claude-code produces no output.
+It means claude-code is thinking or doing something without printing.
+If "last activity" climbs past several minutes, the agent may be stuck.
 
-**To debug:**
-
-1. Check that the task file was created:
-   ```bash
-   cat .ralph/ralph-tasks.md
-   ```
-   If it doesn't exist or is empty after iteration 1, claude-code failed to plan.
-
-2. Check the stream log for what claude-code actually did:
-   ```bash
-   # if using foreman-run
-   cat done/prd-07-my-feature-stream-<ts>.log
-   # if running ralph directly, look in current terminal output
-   ```
-
-3. Check if the loop is stuck with stale state:
-   ```bash
-   ralph --status --tasks
-   ```
-   If it shows `active: true` but no process is running, clear it:
-   ```bash
-   mv .ralph done/stale-ralph-manual/
-   ```
-
-4. Seed the tasks manually if claude-code refuses to plan:
-   ```bash
-   ralph --add-task "US-003 implement login page"
-   ralph --add-task "US-004 add logout button"
-   ```
-   Then restart ralph pointing at the PRD. It will pick up the pre-seeded tasks.
-
-5. Run with more iterations to give claude-code time to plan AND start working:
-   ```bash
-   ralph --file tasks/prd-07-my-feature.md --tasks --agent claude-code --max-iterations 10
-   ```
-   The default `--max-iterations 3` in foreman-run.py may be too low for complex PRDs.
-
-### C. US placeholder format summary
+### D. US placeholder format summary (PRD mode)
 
 | Format | Works with foreman-prepare? | Notes |
 |---|---|---|
-| `US-x` | NO | `x` is not a digit, regex won't match |
-| `US-1` | YES | simplest placeholder |
+| `US-x` | NO | `x` is not a digit |
+| `US-1` | YES | simplest |
 | `US-001` | YES | also fine, gets renumbered anyway |
-| `### US-003` | YES (heading level doesn't matter) | already has digits |
-| `## US-x` | NO | same issue as first row |
+| `## US-003` | YES | heading level doesn't matter |
 
 Use `US-1`, `US-2`, ... as your placeholders when writing a new PRD.
+
+### E. Troubleshooting
+
+**Ralph loops without completing** — manually resume:
+```bash
+ralph --file tasks/prd-07-cloud-sync.md --tasks --agent claude-code
+```
+
+**Stale active loop** — if `.ralph/ralph-loop.state.json` shows `active: true`
+but no ralph is running:
+```bash
+mv .ralph done/stale-ralph-manual/
+```
+
+**Todo task shows INCOMPLETE** — inspect the log:
+```bash
+cat done/todo-<name>-claude-<ts>/<name>.log
+```
+The log contains both pass 1 and pass 2 output separated by `===` headers.
+Look for the COMPLETE signal near the end of each pass.
+
+**Todo task symlink left behind** — if foreman-run was interrupted during a todo job,
+the symlink stays in `todo/`. On restart, foreman-run will attempt the job again
+from pass 1.
